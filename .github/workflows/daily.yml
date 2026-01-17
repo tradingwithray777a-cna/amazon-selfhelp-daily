@@ -1,33 +1,28 @@
-name: Daily Amazon Self-Help Tracker
+name: Daily Amazon Self-Help Tracker (Artifacts)
 
 on:
   workflow_dispatch:
   schedule:
-    # 00:30 UTC = 08:30 Singapore time (UTC+8)
+    # GitHub cron is in UTC. Singapore is UTC+8.
+    # 00:30 UTC = 08:30 Singapore time
     - cron: "30 0 * * *"
 
-# Prevent two runs from pushing at the same time
+# Prevent overlapping runs
 concurrency:
   group: amazon-selfhelp-daily
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout (full history)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    timeout-minutes: 20
 
-      # Make sure the runner is on the latest remote main before doing anything
-      - name: Sync with remote main
-        run: |
-          git fetch origin main
-          git reset --hard origin/main
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -36,6 +31,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run scraper
@@ -44,8 +40,22 @@ jobs:
         run: |
           python run_daily.py
 
-          - name: Upload outputs
+      # Debug: show files even if something fails
+      - name: Show output folder (debug)
+        if: always()
+        run: |
+          echo "=== Repo root ==="
+          ls -la
+          echo "=== Output folder ==="
+          ls -la output || true
+          echo "=== Output CSV preview ==="
+          head -n 5 output/*_all.csv 2>/dev/null || true
+          head -n 5 output/*_shortlist.csv 2>/dev/null || true
+
+      - name: Upload outputs as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daily-output
           path: output/*.csv
+          if-no-files-found: warn
