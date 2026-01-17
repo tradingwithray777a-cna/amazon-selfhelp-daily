@@ -1,13 +1,11 @@
-name: Daily Amazon Self-Help Tracker (Artifacts)
+name: Daily Amazon Self-Help Tracker (Artifacts Only)
 
 on:
   workflow_dispatch:
   schedule:
-    # GitHub cron is in UTC. Singapore is UTC+8.
-    # 00:30 UTC = 08:30 Singapore time
+    # 00:30 UTC = 08:30 Singapore time (UTC+8)
     - cron: "30 0 * * *"
 
-# Prevent overlapping runs
 concurrency:
   group: amazon-selfhelp-daily
   cancel-in-progress: true
@@ -39,18 +37,6 @@ jobs:
           WSA_API_KEY: ${{ secrets.WSA_API_KEY }}
         run: |
           python run_daily.py
-
-      # Debug: show files even if something fails
-      - name: Show output folder (debug)
-        if: always()
-        run: |
-          echo "=== Repo root ==="
-          ls -la
-          echo "=== Output folder ==="
-          ls -la output || true
-          echo "=== Output CSV preview ==="
-          head -n 5 output/*_all.csv 2>/dev/null || true
-          head -n 5 output/*_shortlist.csv 2>/dev/null || true
 
       - name: Upload outputs as artifact
         if: always()
