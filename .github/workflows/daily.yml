@@ -3,9 +3,13 @@ name: Daily Amazon Self-Help Tracker
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions schedule uses UTC time. :contentReference[oaicite:4]{index=4}
     # 00:30 UTC = 08:30 Singapore time (UTC+8)
     - cron: "30 0 * * *"
+
+# Prevent two runs from pushing at the same time
+concurrency:
+  group: amazon-selfhelp-daily
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -14,8 +18,16 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout (full history)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Make sure the runner is on the latest remote main before doing anything
+      - name: Sync with remote main
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -32,7 +44,7 @@ jobs:
         run: |
           python run_daily.py
 
-      - name: Commit outputs
+      - name: Commit outputs (sync then push)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -40,6 +52,6 @@ jobs:
           git add output/*.csv || true
           git commit -m "Daily output" || exit 0
 
-          # Sync with remote first to avoid "fetch first" rejection
-          git pull --rebase
-          git push
+          # If anything changed remotely during the run, rebase then push
+          git pull --rebase origin main
+          git push origin main
