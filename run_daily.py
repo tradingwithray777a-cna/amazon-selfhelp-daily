@@ -75,22 +75,6 @@ def fetch_html(page, url: str) -> str:
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     safe_wait(page)
     maybe_accept_cookies(page)
-
-    # Let dynamic sections finish loading
-    try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except Exception:
-        pass
-
-    # Trigger lazy-loaded product details
-    try:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1200)
-        page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(400)
-    except Exception:
-        pass
-
     return page.content()
 
 
@@ -145,34 +129,16 @@ def extract_title_author(product_html: str) -> Tuple[str, str]:
 
 def parse_best_sellers_rank(product_html: str) -> Optional[int]:
     """
-    Extract the first number after "Best Sellers Rank" from common product-detail sections.
+    Extract the first number after "Best Sellers Rank" (overall rank line shown on product detail page).
     """
     soup = BeautifulSoup(product_html, "lxml")
-
-    candidates = []
-    for sel in [
-        "#detailBulletsWrapper_feature_div",
-        "#detailBullets_feature_div",
-        "#productDetails_detailBullets_sections1",
-        "#productDetails_db_sections",
-        "#bookDetails_feature_div",
-    ]:
-        node = soup.select_one(sel)
-        if node:
-            candidates.append(node.get_text("\n", strip=True))
-
-    # Fallback: whole page text
-    candidates.append(soup.get_text("\n", strip=True))
-
-    for text in candidates:
-        idx = text.lower().find("best sellers rank")
-        snippet = text[idx: idx + 6000] if idx != -1 else text
-        m = re.search(r"Best\s*Sellers\s*Rank.*?#\s*([\d,]+)", snippet, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            return int(m.group(1).replace(",", ""))
-
-    return None
-
+    text = soup.get_text("\n", strip=True)
+    idx = text.lower().find("best sellers rank")
+    snippet = text[idx: idx + 5000] if idx != -1 else text[:5000]
+    m = re.search(r"Best Sellers Rank.*?#\s*([\d,]+)", snippet, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    return int(m.group(1).replace(",", ""))
 
 
 def topic_from_title(title: str) -> str:
@@ -296,3 +262,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
