@@ -1,0 +1,40 @@
+name: Daily Amazon Self-Help #5 Tracker
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions scheduled cron uses UTC (convert from Singapore time). :contentReference[oaicite:4]{index=4}
+    # 00:20 UTC = 08:20 Singapore time (UTC+8)
+    - cron: "20 0 * * *"
+
+permissions:
+  contents: write  # needed to commit CSV back to the repo :contentReference[oaicite:5]{index=5}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper
+        run: |
+          python run_daily.py
+
+      - name: Commit outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/*.csv || true
+          git commit -m "Daily output" || exit 0
+          git push
