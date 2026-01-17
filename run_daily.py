@@ -1,6 +1,8 @@
 import os
 import re
 import datetime
+import time
+import random
 from urllib.parse import quote_plus
 
 import requests
@@ -48,25 +50,55 @@ SUB_NICHES = [
 
 OUTPUT_DIR = "output"
 
-# WebScrapingAPI endpoint style:
+# WebScrapingAPI endpoint:
 # https://api.webscrapingapi.com/v2?api_key=<YOUR_API_KEY>&url=<ENCODED_URL>
-# (per their GET request documentation) :contentReference[oaicite:3]{index=3}
 WSA_API_KEY = os.getenv("WSA_API_KEY", "").strip()
 
 
 def simplify(s: str) -> str:
-    # lower + keep only letters/numbers (helps match labels)
+    """Lowercase and keep only letters/numbers (helps match labels)."""
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
-def wsa_fetch_html(url: str) -> str:
-    """Fetch HTML via WebScrapingAPI (more reliable on Amazon from GitHub runners)."""
+def wsa_fetch_html(url: str, max_retries: int = 6) -> str:
+    """
+    Fetch HTML via WebScrapingAPI with retry/backoff for 429 rate limits and temporary 5xx errors.
+    Adds a small delay between successful calls to avoid bursts.
+    """
     if not WSA_API_KEY:
         raise RuntimeError("Missing WSA_API_KEY secret. Add it in GitHub repo settings.")
+
     api = f"https://api.webscrapingapi.com/v2?api_key={WSA_API_KEY}&url={quote_plus(url)}"
-    r = requests.get(api, timeout=90)
-    r.raise_for_status()
-    return r.text
+
+    for attempt in range(max_retries):
+        r = requests.get(api, timeout=90)
+
+        # Rate limit (Too Many Requests)
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After", "")
+            if retry_after.isdigit():
+                wait_s = int(retry_after)
+            else:
+                wait_s = min(60, 2 ** (attempt + 1))
+            wait_s = wait_s + random.uniform(0.5, 2.0)
+            print(f"[WSA] 429 Too Many Requests. Waiting {wait_s:.1f}s then retrying...")
+            time.sleep(wait_s)
+            continue
+
+        # Temporary server issues
+        if r.status_code in (500, 503):
+            wait_s = min(60, 2 ** (attempt + 1)) + random.uniform(0.5, 2.0)
+            print(f"[WSA] {r.status_code} server issue. Waiting {wait_s:.1f}s then retrying...")
+            time.sleep(wait_s)
+            continue
+
+        r.raise_for_status()
+
+        # Gentle throttle between successful calls
+        time.sleep(1.2 + random.uniform(0.0, 1.0))
+        return r.text
+
+    raise RuntimeError("WebScrapingAPI kept returning 429 (rate limit). Try later or reduce repeated runs.")
 
 
 def extract_left_nav_links(html: str) -> dict:
@@ -102,7 +134,6 @@ def best_match_link(subniche: str, link_map: dict) -> str | None:
     best_url = None
     best_score = 0
     for k, url in link_map.items():
-        # simple overlap scoring
         score = 0
         for ch in set(key):
             if ch in k:
@@ -190,7 +221,7 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     run_date = datetime.date.today().isoformat()
 
-    # Fetch main page via WebScrapingAPI and parse left nav links
+    # Fetch main page and parse left nav links
     base_html = wsa_fetch_html(BASE_URL)
     link_map = extract_left_nav_links(base_html)
 
