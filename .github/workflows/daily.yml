@@ -45,9 +45,9 @@ jobs:
       - name: Run scraper
         env:
           WSA_API_KEY: ${{ secrets.WSA_API_KEY }}
-          WSA_MIN_GAP_SECONDS: "12"
+          WSA_MIN_GAP_SECONDS: "18"
           WSA_JITTER_SECONDS: "3"
-          WSA_MAX_TOTAL_WAIT_SECONDS: "900"
+          WSA_MAX_TOTAL_WAIT_SECONDS: "1200"
         run: |
           python run_daily.py
 
