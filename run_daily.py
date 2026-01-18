@@ -1,17 +1,18 @@
-import os
-import re
 import csv
-import time
+import os
 import random
-import datetime
-from urllib.parse import urljoin
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import quote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
-# -----------------------------
-# CONFIG
-# -----------------------------
+# =========================
+# SETTINGS
+# =========================
 BASE_URL = "https://www.amazon.com/Best-Sellers-Kindle-Store-Self-Help/zgbs/digital-text/156563011"
 
 SUBNICHES = [
@@ -46,438 +47,249 @@ SUBNICHES = [
     "Time Management",
 ]
 
-# WebScrapingAPI Scraper API (v2) endpoint format:
-# https://api.webscrapingapi.com/v2?api_key=<YOUR_API_KEY>&url=<TARGETED_URL> :contentReference[oaicite:1]{index=1}
+# If BSR (Amazon Best Sellers Rank) number is BELOW this, we shortlist
+BSR_THRESHOLD = 20000
+
+# =========================
+# WSA (WebScrapingAPI) CONFIG
+# =========================
 WSA_ENDPOINT = "https://api.webscrapingapi.com/v2"
 
-# Tuning knobs (you can also set these as GitHub Action env vars)
-WSA_TIMEOUT_SECONDS = int(os.getenv("WSA_TIMEOUT_SECONDS", "60"))
+WSA_API_KEY = os.getenv("WSA_API_KEY", "").strip()
 
-# Minimum spacing between ANY two WSA calls (prevents “short succession” rate limit)
-WSA_MIN_GAP_SECONDS = float(os.getenv("WSA_MIN_GAP_SECONDS", "6.0"))
+# Politeness controls (tune via GitHub Actions env)
+MIN_GAP_SECONDS = float(os.getenv("WSA_MIN_GAP_SECONDS", "20"))  # gap between successful calls
+JITTER_SECONDS = float(os.getenv("WSA_JITTER_SECONDS", "5"))     # random extra wait
+MAX_RETRIES = int(os.getenv("WSA_MAX_RETRIES", "10"))
+MAX_TOTAL_WAIT_SECONDS = int(os.getenv("WSA_MAX_TOTAL_WAIT_SECONDS", "900"))
 
-# How long we are willing to “sit inside the workflow” retrying 429 before giving up for the day
-WSA_MAX_TOTAL_WAIT_SECONDS = int(os.getenv("WSA_MAX_TOTAL_WAIT_SECONDS", "2400"))  # 40 min
+# Force JS rendering OFF (cheaper / less heavy). Default is off anyway, but be explicit.
+RENDER_JS = os.getenv("WSA_RENDER_JS", "0")
 
-# Rank filter
-MAX_BSR = int(os.getenv("MAX_BSR", "20000"))
-
-OUT_DIR = "output"
+_last_call_ts = 0.0
 
 
-# -----------------------------
-# HELPERS
-# -----------------------------
-def norm_text(s: str) -> str:
+def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("&", "and")
-    s = re.sub(r"[’'`]", "", s)
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s()\-]", "", s)
     return s
 
 
-def token_score(a: str, b: str) -> float:
-    """Simple token overlap score for fuzzy matching."""
-    ta = set(norm_text(a).split())
-    tb = set(norm_text(b).split())
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / max(1, len(ta | tb))
-
-
-_last_wsa_call_ts = 0.0
-
-
-def _throttle():
-    """Enforce minimum spacing between WSA calls."""
-    global _last_wsa_call_ts
+def _sleep_polite():
+    global _last_call_ts
     now = time.time()
-    gap = now - _last_wsa_call_ts
-    if gap < WSA_MIN_GAP_SECONDS:
-        sleep_for = (WSA_MIN_GAP_SECONDS - gap) + random.uniform(0.2, 1.0)
-        time.sleep(sleep_for)
-    _last_wsa_call_ts = time.time()
+    gap = MIN_GAP_SECONDS - (now - _last_call_ts)
+    if gap > 0:
+        time.sleep(gap)
+    if JITTER_SECONDS > 0:
+        time.sleep(random.uniform(0, JITTER_SECONDS))
 
 
-def wsa_fetch_html(session: requests.Session, target_url: str) -> str:
+def wsa_fetch_html(target_url: str) -> str:
     """
-    Fetch a page via WebScrapingAPI.
-    Retries hard on 429 with long backoff so your workflow doesn't just die.
+    Fetch HTML via WebScrapingAPI with strong backoff on 429.
+    If 429 persists too long, raises RuntimeError.
     """
-    api_key = os.getenv("WSA_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("Missing WSA_API_KEY. Add it in GitHub: Settings → Secrets and variables → Actions.")
+    global _last_call_ts
 
-    start = time.time()
+    params = {
+        "api_key": WSA_API_KEY,
+        "url": target_url,
+        "render_js": RENDER_JS,  # docs: render_js 0/1 :contentReference[oaicite:1]{index=1} (for you; not used in UI)
+    }
+
+    total_waited = 0.0
     attempt = 0
 
-    while True:
-        # Stop if we have already waited too long overall
-        elapsed = time.time() - start
-        if elapsed > WSA_MAX_TOTAL_WAIT_SECONDS:
-            raise RuntimeError(
-                f"WSA kept rate-limiting (429) for too long. Total waited ~{int(elapsed)}s."
-            )
+    while attempt <= MAX_RETRIES:
+        _sleep_polite()
 
-        _throttle()
-
-        params = {
-            "api_key": api_key,
-            "url": target_url,
-        }
-
+        api_url = f"{WSA_ENDPOINT}?api_key={quote(WSA_API_KEY)}&url={quote(target_url)}&render_js={quote(str(RENDER_JS))}"
         try:
-            r = session.get(WSA_ENDPOINT, params=params, timeout=WSA_TIMEOUT_SECONDS)
-        except requests.RequestException as e:
-            # Network blip: backoff and retry
-            wait = min(180, (2 ** min(attempt, 6)) * 2 + random.uniform(0.5, 2.5))
-            print(f"[WSA] Network error: {e}. Waiting {wait:.1f}s then retrying...")
-            time.sleep(wait)
+            r = requests.get(api_url, timeout=120)
+        except Exception as e:
             attempt += 1
+            backoff = min(60, 2 ** attempt) + random.uniform(0, 1.5)
+            total_waited += backoff
+            if total_waited > MAX_TOTAL_WAIT_SECONDS:
+                raise RuntimeError(f"Network errors kept happening. Total waited ~{int(total_waited)}s. Last error: {e}")
+            print(f"[WSA] Network error. Waiting {backoff:.1f}s then retrying...")
+            time.sleep(backoff)
             continue
 
-        if r.status_code == 200 and r.text:
+        _last_call_ts = time.time()
+
+        if r.status_code == 200:
             return r.text
 
-        # 429 handling (main issue)
         if r.status_code == 429:
-            # Prefer server hint if present
-            ra = r.headers.get("Retry-After", "").strip()
-            if ra.isdigit():
-                wait = int(ra) + random.uniform(0.5, 2.0)
+            attempt += 1
+
+            retry_after = r.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                backoff = float(retry_after)
             else:
-                # long exponential backoff with cap
-                wait = min(300, (2 ** min(attempt, 7)) * 2 + random.uniform(1.0, 4.0))
-            print(f"[WSA] 429 Too Many Requests. Waiting {wait:.1f}s then retrying...")
-            time.sleep(wait)
-            attempt += 1
+                # Exponential backoff with cap
+                backoff = min(180, (2 ** attempt)) + random.uniform(0, 2.5)
+
+            total_waited += backoff
+            if total_waited > MAX_TOTAL_WAIT_SECONDS:
+                raise RuntimeError(
+                    f"RUN FAILED EARLY: WSA kept rate-limiting (429) for too long. Total waited ~{int(total_waited)}s."
+                )
+
+            print(f"[WSA] 429 Too Many Requests. Waiting {backoff:.1f}s then retrying...")
+            time.sleep(backoff)
             continue
 
-        # transient server errors
-        if r.status_code in (500, 503):
-            wait = min(180, (2 ** min(attempt, 6)) * 2 + random.uniform(0.5, 2.5))
-            print(f"[WSA] {r.status_code} Server error. Waiting {wait:.1f}s then retrying...")
-            time.sleep(wait)
-            attempt += 1
-            continue
-
-        # other errors: raise with detail
+        # Other errors
         try:
             r.raise_for_status()
-        except Exception:
-            raise RuntimeError(f"WSA error {r.status_code} for {target_url}. Body (first 200): {r.text[:200]}")
+        except Exception as e:
+            raise RuntimeError(f"WSA request failed: HTTP {r.status_code}. {e}") from e
+
+    raise RuntimeError("WSA kept returning 429 too many times. Reduce re-runs and slow down request rate.")
 
 
-def extract_subniche_links(base_html: str) -> dict:
+def parse_subniche_links(base_html: str) -> dict:
     """
-    Pull the left-nav subcategory links from the Best Sellers page.
-    Returns mapping: normalized subniche text -> absolute url
+    Extract sub-niche links from the base best-sellers page.
+    Returns dict: normalized_subniche_name -> absolute_url
     """
     soup = BeautifulSoup(base_html, "lxml")
-    root = soup.find(id="zg_browseRoot")
-
     links = {}
-    if root:
-        for a in root.select("a[href]"):
-            txt = a.get_text(" ", strip=True)
-            href = a.get("href", "").strip()
-            if not txt or not href:
-                continue
-            abs_url = urljoin("https://www.amazon.com", href)
-            links[norm_text(txt)] = abs_url
+
+    # Amazon best-sellers pages typically have lots of <a> tags; we keep likely subcategory links.
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        text = a.get_text(" ", strip=True)
+
+        if not text or not href:
+            continue
+
+        # Heuristic: subcategory links usually remain within /zgbs/digital-text/ and are not the same page
+        if "/zgbs/digital-text/" not in href:
+            continue
+
+        # Make absolute URL
+        abs_url = urljoin("https://www.amazon.com", href)
+
+        # Avoid picking the base page itself as a "subcategory"
+        if abs_url.rstrip("/") == BASE_URL.rstrip("/"):
+            continue
+
+        # Keep only links that look like within Self-Help Kindle Store best-sellers
+        # (This is a heuristic; Amazon changes markup often.)
+        ntext = _norm(text)
+        if len(ntext) < 3:
+            continue
+
+        links[ntext] = abs_url
 
     return links
 
 
-def pick_best_match(target: str, link_map: dict) -> str | None:
+def extract_ranked_items(bestseller_html: str):
     """
-    Find the best matching link for a target subniche name.
+    Return a list of dict items with at least: rank (int), asin (str|None), title (str), product_url (str|None)
     """
-    nt = norm_text(target)
-    if nt in link_map:
-        return link_map[nt]
+    soup = BeautifulSoup(bestseller_html, "lxml")
 
-    best = (0.0, None)
-    for k, v in link_map.items():
-        sc = token_score(nt, k)
-        if sc > best[0]:
-            best = (sc, v)
+    items = []
+    # Common patterns: elements with data-asin
+    for el in soup.select("[data-asin]"):
+        asin = (el.get("data-asin") or "").strip()
+        if not asin:
+            continue
 
-    # Require a decent match, otherwise return None
-    return best[1] if best[0] >= 0.5 else None
-
-
-def parse_bestseller_ranked_items(html: str) -> list[dict]:
-    """
-    Parse the ordered list of best sellers.
-    Returns list of dicts: {rank, title, url, asin}
-    """
-    soup = BeautifulSoup(html, "lxml")
-
-    # Most best-seller pages use this:
-    ol = soup.select_one("ol#zg-ordered-list")
-    candidates = []
-    if ol:
-        lis = ol.select(":scope > li")
-        for idx, li in enumerate(lis, start=1):
-            a = li.select_one("a.a-link-normal[href*='/dp/'], a.a-link-normal[href*='/gp/']")
-            if not a:
-                continue
-            href = urljoin("https://www.amazon.com", a.get("href", ""))
-            title = None
-
-            t = li.select_one("div.p13n-sc-truncated")
-            if t and t.get_text(strip=True):
-                title = t.get_text(" ", strip=True)
-            if not title:
-                img = li.select_one("img[alt]")
-                if img and img.get("alt"):
-                    title = img.get("alt").strip()
-            if not title:
-                title = a.get_text(" ", strip=True) or ""
-
-            asin = None
-            m = re.search(r"/dp/([A-Z0-9]{10})", href)
-            if not m:
-                m = re.search(r"/gp/product/([A-Z0-9]{10})", href)
+        # Find rank text nearby like "#1"
+        rank = None
+        rank_el = el.select_one(".zg-bdg-text")
+        if rank_el:
+            m = re.search(r"#\s*(\d+)", rank_el.get_text(strip=True))
             if m:
-                asin = m.group(1)
+                rank = int(m.group(1))
 
-            candidates.append({"rank": idx, "title": title, "url": href, "asin": asin})
+        # Title: sometimes in img alt or a link title
+        title = ""
+        img = el.select_one("img[alt]")
+        if img and img.get("alt"):
+            title = img.get("alt", "").strip()
 
-    # Fallback: if structure changes, grab dp links and keep first 100 unique
-    if not candidates:
-        seen = set()
-        for a in soup.select("a[href*='/dp/']"):
-            href = urljoin("https://www.amazon.com", a.get("href", ""))
-            m = re.search(r"/dp/([A-Z0-9]{10})", href)
-            if not m:
-                continue
-            asin = m.group(1)
-            if asin in seen:
-                continue
-            seen.add(asin)
+        if not title:
+            a = el.select_one("a.a-link-normal[href]")
+            if a:
+                title = a.get_text(" ", strip=True)
 
-            title = a.get_text(" ", strip=True)
-            if not title:
-                img = a.select_one("img[alt]")
-                if img and img.get("alt"):
-                    title = img.get("alt").strip()
+        # Product URL: prefer /dp/ASIN
+        product_url = None
+        dp = f"https://www.amazon.com/dp/{asin}"
+        product_url = dp
 
-            candidates.append({"rank": len(candidates) + 1, "title": title or "", "url": href, "asin": asin})
-            if len(candidates) >= 100:
-                break
+        if rank is not None:
+            items.append({"rank": rank, "asin": asin, "title": title, "product_url": product_url})
 
-    return candidates
+    # Deduplicate by rank (keep first)
+    by_rank = {}
+    for it in items:
+        r = it["rank"]
+        if r not in by_rank:
+            by_rank[r] = it
+
+    ordered = [by_rank[r] for r in sorted(by_rank.keys())]
+    return ordered
 
 
-def parse_best_sellers_rank_number(product_html: str) -> tuple[int | None, str]:
+def extract_bsr_number(product_html: str):
     """
-    Extract the first numeric "Best Sellers Rank" value from product page.
-    Returns (bsr_number, context_text)
+    Extract the first numeric "Amazon Best Sellers Rank" value from product page.
+    Returns int or None.
     """
-    soup = BeautifulSoup(product_html, "lxml")
+    text = BeautifulSoup(product_html, "lxml").get_text("\n", strip=True)
 
-    # Try targeted areas first
-    sections = []
-    for sec_id in ["detailBullets_feature_div", "detailBulletsWrapper_feature_div", "prodDetails", "bookDetails_container"]:
-        s = soup.find(id=sec_id)
-        if s:
-            sections.append(s.get_text("\n", strip=True))
+    # Find chunk around "Amazon Best Sellers Rank"
+    idx = text.lower().find("amazon best sellers rank")
+    if idx == -1:
+        return None
 
-    # Add full text as last resort (can be large)
-    sections.append(soup.get_text("\n", strip=True))
-
-    joined = "\n".join(sections)
-
-    # Match either "Amazon Best Sellers Rank" or "Best Sellers Rank"
-    # Capture first "#12,345" style number after that label
-    m = re.search(r"(Amazon\s+Best\s+Sellers\s+Rank|Best\s+Sellers\s+Rank)\s*[:\-]?\s*#\s*([\d,]+)", joined, re.IGNORECASE)
+    window = text[idx: idx + 1200]
+    m = re.search(r"#\s*([\d,]{1,20})", window)
     if not m:
-        # Sometimes formatted like "Best Sellers Rank #12,345 in Kindle Store"
-        m = re.search(r"(Amazon\s+Best\s+Sellers\s+Rank|Best\s+Sellers\s+Rank).*?#\s*([\d,]+)", joined, re.IGNORECASE)
+        return None
 
-    if m:
-        num = int(m.group(2).replace(",", ""))
-        # Take a short nearby context snippet for debugging
-        start = max(0, m.start() - 60)
-        end = min(len(joined), m.end() + 120)
-        ctx = joined[start:end].replace("\n", " ")
-        ctx = re.sub(r"\s+", " ", ctx).strip()
-        return num, ctx
-
-    return None, ""
+    num = m.group(1).replace(",", "")
+    if num.isdigit():
+        return int(num)
+    return None
 
 
-def infer_topic(title: str, subniche: str) -> str:
+def infer_topic(title: str) -> str:
     """
-    Simple, non-AI topic inference (since you want something understandable).
+    Simple, readable 'topic' based on title/subtitle keywords.
     """
-    t = (title or "").lower()
+    t = (title or "").strip()
+    if not t:
+        return ""
 
-    # Lightweight keyword rules
-    rules = [
-        ("anxiety", "Anxiety / Panic / Worry"),
+    # Prefer subtitle after colon if present
+    if ":" in t:
+        after = t.split(":", 1)[1].strip()
+        if after:
+            return after[:120]
+
+    tlow = t.lower()
+
+    keywords = [
+        ("anxiety", "Anxiety relief"),
         ("phobia", "Phobias"),
-        ("anger", "Anger Management"),
-        ("stress", "Stress / Burnout"),
-        ("trauma", "Trauma / Healing"),
-        ("narciss", "Narcissism / Toxic Relationships"),
-        ("adhd", "ADHD / Focus"),
-        ("habit", "Habits / Behavior Change"),
-        ("mindset", "Mindset / Growth"),
-        ("confidence", "Confidence / Self-Esteem"),
-        ("self esteem", "Self-Esteem"),
-        ("time management", "Time Management"),
-        ("productivity", "Productivity"),
-        ("affirmation", "Affirmations"),
-        ("journ", "Journaling / Writing"),
-        ("inner child", "Inner Child Work"),
+        ("anger", "Anger management"),
+        ("stress", "Stress management"),
+        ("habit", "Habits & behavior change"),
         ("nlp", "NLP"),
-        ("meditat", "Meditation / Mindfulness"),
-        ("spiritual", "Spiritual Growth"),
-    ]
-    for key, topic in rules:
-        if key in t:
-            return topic
-
-    # Fallback: subniche itself is already a good “topic”
-    return subniche
-
-
-def write_csv(path: str, rows: list[dict], fieldnames: list[str]):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in fieldnames})
-
-
-# -----------------------------
-# MAIN
-# -----------------------------
-def main():
-    today = datetime.date.today().isoformat()
-    all_path = os.path.join(OUT_DIR, f"{today}_all.csv")
-    shortlist_path = os.path.join(OUT_DIR, f"{today}_shortlist.csv")
-
-    fieldnames = [
-        "date",
-        "subniche",
-        "subniche_url",
-        "picked_rank_in_subniche",
-        "title",
-        "book_url",
-        "asin",
-        "amazon_best_sellers_rank_number",
-        "shortlisted",
-        "topic",
-        "notes",
-    ]
-
-    all_rows = []
-    shortlist_rows = []
-
-    session = requests.Session()
-
-    try:
-        base_html = wsa_fetch_html(session, BASE_URL)
-        link_map = extract_subniche_links(base_html)
-
-        for sub in SUBNICHES:
-            row = {
-                "date": today,
-                "subniche": sub,
-                "subniche_url": "",
-                "picked_rank_in_subniche": 5,
-                "title": "",
-                "book_url": "",
-                "asin": "",
-                "amazon_best_sellers_rank_number": "",
-                "shortlisted": "N",
-                "topic": "",
-                "notes": "",
-            }
-
-            sub_url = pick_best_match(sub, link_map)
-            if not sub_url:
-                row["notes"] = "sub-niche link not found on base page"
-                all_rows.append(row)
-                continue
-
-            row["subniche_url"] = sub_url
-
-            try:
-                sub_html = wsa_fetch_html(session, sub_url)
-                items = parse_bestseller_ranked_items(sub_html)
-            except Exception as e:
-                row["notes"] = f"failed to fetch/parse subniche list: {e}"
-                all_rows.append(row)
-                continue
-
-            if len(items) < 5:
-                row["notes"] = f"subniche list has < 5 items (found {len(items)})"
-                all_rows.append(row)
-                continue
-
-            fifth = items[4]
-            row["title"] = fifth.get("title", "")
-            row["book_url"] = fifth.get("url", "")
-            row["asin"] = fifth.get("asin", "")
-
-            if not row["book_url"]:
-                row["notes"] = "could not extract book url for #5"
-                all_rows.append(row)
-                continue
-
-            try:
-                prod_html = wsa_fetch_html(session, row["book_url"])
-                bsr_num, ctx = parse_best_sellers_rank_number(prod_html)
-            except Exception as e:
-                row["notes"] = f"failed to fetch/parse product page: {e}"
-                all_rows.append(row)
-                continue
-
-            if bsr_num is None:
-                row["notes"] = "Best Sellers Rank not found on product page"
-                all_rows.append(row)
-                continue
-
-            row["amazon_best_sellers_rank_number"] = bsr_num
-            row["topic"] = infer_topic(row["title"], sub)
-
-            if bsr_num < MAX_BSR:
-                row["shortlisted"] = "Y"
-                shortlist_rows.append(row.copy())
-
-            all_rows.append(row)
-
-    except Exception as e:
-        # If BASE_URL fetch fails (like 429 for too long), we still write CSVs so you get artifacts.
-        all_rows = [{
-            "date": today,
-            "subniche": "",
-            "subniche_url": "",
-            "picked_rank_in_subniche": "",
-            "title": "",
-            "book_url": "",
-            "asin": "",
-            "amazon_best_sellers_rank_number": "",
-            "shortlisted": "",
-            "topic": "",
-            "notes": f"RUN FAILED EARLY: {e}",
-        }]
-        shortlist_rows = []
-
-    # Always write output files (so GitHub Artifacts will show something)
-    write_csv(all_path, all_rows, fieldnames)
-    write_csv(shortlist_path, shortlist_rows, fieldnames)
-
-    print(f"Wrote: {all_path}")
-    print(f"Wrote: {shortlist_path}")
-
-
-if __name__ == "__main__":
-    main()
+        ("confidence", "Confidence & self-esteem"),
+        ("self-esteem", "Self-esteem"),
+        ("trauma", "Trauma healing"),
+        ("inner child", "Inner child healing"),
+        ("journ", "Journaling / prompts
