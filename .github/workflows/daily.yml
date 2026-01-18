@@ -3,9 +3,11 @@ name: Daily Amazon Self-Help Tracker (Artifacts Only)
 on:
   workflow_dispatch:
   schedule:
-    # 00:30 UTC = 08:30 Singapore time (UTC+8)
+    # GitHub cron uses UTC. Singapore is UTC+8.
+    # 00:30 UTC = 08:30 Singapore time
     - cron: "30 0 * * *"
 
+# Prevent overlapping runs (so you don't accidentally hit rate limits harder)
 concurrency:
   group: amazon-selfhelp-daily
   cancel-in-progress: true
@@ -35,27 +37,31 @@ jobs:
       - name: Prepare output folder
         run: |
           mkdir -p output
+          echo "Repo root:"
           ls -la
-
+          echo "Output folder:"
+          ls -la output || true
 
       - name: Run scraper
-
-      env:
-      WSA_API_KEY: ${{ secrets.WSA_API_KEY }}
-      WSA_MIN_GAP_SECONDS: "12"
-      WSA_JITTER_SECONDS: "3"
-      WSA_MAX_TOTAL_WAIT_SECONDS: "900"
+        env:
+          WSA_API_KEY: ${{ secrets.WSA_API_KEY }}
+          WSA_MIN_GAP_SECONDS: "12"
+          WSA_JITTER_SECONDS: "3"
+          WSA_MAX_TOTAL_WAIT_SECONDS: "900"
         run: |
           python run_daily.py
-          
 
       - name: Show output folder (debug)
         if: always()
         run: |
-          echo "=== OUTPUT TREE ==="
+          echo "=== OUTPUT FILES ==="
           ls -la output || true
-          echo "=== FIND CSV ==="
+          echo "=== CSV FOUND ==="
           find output -maxdepth 2 -type f -name "*.csv" -print || true
+          echo "=== PREVIEW ALL.CSV (first 5 lines) ==="
+          head -n 5 output/*_all.csv 2>/dev/null || true
+          echo "=== PREVIEW SHORTLIST.CSV (first 5 lines) ==="
+          head -n 5 output/*_shortlist.csv 2>/dev/null || true
 
       - name: Upload outputs as artifact
         if: always()
