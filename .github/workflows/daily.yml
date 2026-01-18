@@ -16,7 +16,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -32,6 +32,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Prepare output folder
+        run: |
+          mkdir -p output
+          ls -la
+
       - name: Run scraper
         env:
           WSA_API_KEY: ${{ secrets.WSA_API_KEY }}
@@ -39,3 +44,19 @@ jobs:
           WSA_MAX_TOTAL_WAIT_SECONDS: "2400"
         run: |
           python run_daily.py
+
+      - name: Show output folder (debug)
+        if: always()
+        run: |
+          echo "=== OUTPUT TREE ==="
+          ls -la output || true
+          echo "=== FIND CSV ==="
+          find output -maxdepth 2 -type f -name "*.csv" -print || true
+
+      - name: Upload outputs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-output
+          path: output/**/*.csv
+          if-no-files-found: error
