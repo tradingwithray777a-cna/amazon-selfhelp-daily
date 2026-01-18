@@ -16,7 +16,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -35,13 +35,7 @@ jobs:
       - name: Run scraper
         env:
           WSA_API_KEY: ${{ secrets.WSA_API_KEY }}
+          WSA_MIN_GAP_SECONDS: "7"
+          WSA_MAX_TOTAL_WAIT_SECONDS: "2400"
         run: |
           python run_daily.py
-
-      - name: Upload outputs as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: daily-output
-          path: output/*.csv
-          if-no-files-found: warn
