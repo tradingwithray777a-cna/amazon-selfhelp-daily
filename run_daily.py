@@ -1,22 +1,20 @@
 import os
 import re
-import datetime
+import csv
 import time
 import random
-from urllib.parse import quote_plus
+import datetime
+from urllib.parse import urljoin
 
 import requests
-import pandas as pd
 from bs4 import BeautifulSoup
 
-# 1) Your main Self-Help bestseller page
+# -----------------------------
+# CONFIG
+# -----------------------------
 BASE_URL = "https://www.amazon.com/Best-Sellers-Kindle-Store-Self-Help/zgbs/digital-text/156563011"
 
-# 2) Your shortlist rule (overall Amazon Best Sellers Rank number)
-RANK_THRESHOLD = 20000
-
-# 3) Your sub-niches list
-SUB_NICHES = [
+SUBNICHES = [
     "Abuse",
     "Affirmations",
     "Aging",
@@ -48,277 +46,437 @@ SUB_NICHES = [
     "Time Management",
 ]
 
-OUTPUT_DIR = "output"
+# WebScrapingAPI Scraper API (v2) endpoint format:
+# https://api.webscrapingapi.com/v2?api_key=<YOUR_API_KEY>&url=<TARGETED_URL> :contentReference[oaicite:1]{index=1}
+WSA_ENDPOINT = "https://api.webscrapingapi.com/v2"
 
-# WebScrapingAPI endpoint:
-# https://api.webscrapingapi.com/v2?api_key=<YOUR_API_KEY>&url=<ENCODED_URL>
-WSA_API_KEY = os.getenv("WSA_API_KEY", "").strip()
+# Tuning knobs (you can also set these as GitHub Action env vars)
+WSA_TIMEOUT_SECONDS = int(os.getenv("WSA_TIMEOUT_SECONDS", "60"))
+
+# Minimum spacing between ANY two WSA calls (prevents “short succession” rate limit)
+WSA_MIN_GAP_SECONDS = float(os.getenv("WSA_MIN_GAP_SECONDS", "6.0"))
+
+# How long we are willing to “sit inside the workflow” retrying 429 before giving up for the day
+WSA_MAX_TOTAL_WAIT_SECONDS = int(os.getenv("WSA_MAX_TOTAL_WAIT_SECONDS", "2400"))  # 40 min
+
+# Rank filter
+MAX_BSR = int(os.getenv("MAX_BSR", "20000"))
+
+OUT_DIR = "output"
 
 
-def simplify(s: str) -> str:
-    """Lowercase and keep only letters/numbers (helps match labels)."""
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+# -----------------------------
+# HELPERS
+# -----------------------------
+def norm_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("&", "and")
+    s = re.sub(r"[’'`]", "", s)
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def wsa_fetch_html(url: str, max_retries: int = 6) -> str:
+def token_score(a: str, b: str) -> float:
+    """Simple token overlap score for fuzzy matching."""
+    ta = set(norm_text(a).split())
+    tb = set(norm_text(b).split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(1, len(ta | tb))
+
+
+_last_wsa_call_ts = 0.0
+
+
+def _throttle():
+    """Enforce minimum spacing between WSA calls."""
+    global _last_wsa_call_ts
+    now = time.time()
+    gap = now - _last_wsa_call_ts
+    if gap < WSA_MIN_GAP_SECONDS:
+        sleep_for = (WSA_MIN_GAP_SECONDS - gap) + random.uniform(0.2, 1.0)
+        time.sleep(sleep_for)
+    _last_wsa_call_ts = time.time()
+
+
+def wsa_fetch_html(session: requests.Session, target_url: str) -> str:
     """
-    Fetch HTML via WebScrapingAPI with retry/backoff for 429 rate limits and temporary 5xx errors.
-    Adds a small delay between successful calls to avoid bursts.
+    Fetch a page via WebScrapingAPI.
+    Retries hard on 429 with long backoff so your workflow doesn't just die.
     """
-    if not WSA_API_KEY:
-        raise RuntimeError("Missing WSA_API_KEY secret. Add it in GitHub repo settings.")
+    api_key = os.getenv("WSA_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing WSA_API_KEY. Add it in GitHub: Settings → Secrets and variables → Actions.")
 
-    api = f"https://api.webscrapingapi.com/v2?api_key={WSA_API_KEY}&url={quote_plus(url)}"
+    start = time.time()
+    attempt = 0
 
-    for attempt in range(max_retries):
-        r = requests.get(api, timeout=90)
+    while True:
+        # Stop if we have already waited too long overall
+        elapsed = time.time() - start
+        if elapsed > WSA_MAX_TOTAL_WAIT_SECONDS:
+            raise RuntimeError(
+                f"WSA kept rate-limiting (429) for too long. Total waited ~{int(elapsed)}s."
+            )
 
-        # Rate limit (Too Many Requests)
+        _throttle()
+
+        params = {
+            "api_key": api_key,
+            "url": target_url,
+        }
+
+        try:
+            r = session.get(WSA_ENDPOINT, params=params, timeout=WSA_TIMEOUT_SECONDS)
+        except requests.RequestException as e:
+            # Network blip: backoff and retry
+            wait = min(180, (2 ** min(attempt, 6)) * 2 + random.uniform(0.5, 2.5))
+            print(f"[WSA] Network error: {e}. Waiting {wait:.1f}s then retrying...")
+            time.sleep(wait)
+            attempt += 1
+            continue
+
+        if r.status_code == 200 and r.text:
+            return r.text
+
+        # 429 handling (main issue)
         if r.status_code == 429:
-            retry_after = r.headers.get("Retry-After", "")
-            if retry_after.isdigit():
-                wait_s = int(retry_after)
+            # Prefer server hint if present
+            ra = r.headers.get("Retry-After", "").strip()
+            if ra.isdigit():
+                wait = int(ra) + random.uniform(0.5, 2.0)
             else:
-                wait_s = min(60, 2 ** (attempt + 1))
-            wait_s = wait_s + random.uniform(0.5, 2.0)
-            print(f"[WSA] 429 Too Many Requests. Waiting {wait_s:.1f}s then retrying...")
-            time.sleep(wait_s)
+                # long exponential backoff with cap
+                wait = min(300, (2 ** min(attempt, 7)) * 2 + random.uniform(1.0, 4.0))
+            print(f"[WSA] 429 Too Many Requests. Waiting {wait:.1f}s then retrying...")
+            time.sleep(wait)
+            attempt += 1
             continue
 
-        # Temporary server issues
+        # transient server errors
         if r.status_code in (500, 503):
-            wait_s = min(60, 2 ** (attempt + 1)) + random.uniform(0.5, 2.0)
-            print(f"[WSA] {r.status_code} server issue. Waiting {wait_s:.1f}s then retrying...")
-            time.sleep(wait_s)
+            wait = min(180, (2 ** min(attempt, 6)) * 2 + random.uniform(0.5, 2.5))
+            print(f"[WSA] {r.status_code} Server error. Waiting {wait:.1f}s then retrying...")
+            time.sleep(wait)
+            attempt += 1
             continue
 
-        r.raise_for_status()
-
-        # Gentle throttle between successful calls
-        time.sleep(1.2 + random.uniform(0.0, 1.0))
-        return r.text
-
-    raise RuntimeError("WebScrapingAPI kept returning 429 (rate limit). Try later or reduce repeated runs.")
+        # other errors: raise with detail
+        try:
+            r.raise_for_status()
+        except Exception:
+            raise RuntimeError(f"WSA error {r.status_code} for {target_url}. Body (first 200): {r.text[:200]}")
 
 
-def extract_left_nav_links(html: str) -> dict:
-    """Parse the left browse tree and return {simplified_text: url}."""
-    soup = BeautifulSoup(html, "lxml")
-    root = soup.select_one("#zg_browseRoot") or soup
+def extract_subniche_links(base_html: str) -> dict:
+    """
+    Pull the left-nav subcategory links from the Best Sellers page.
+    Returns mapping: normalized subniche text -> absolute url
+    """
+    soup = BeautifulSoup(base_html, "lxml")
+    root = soup.find(id="zg_browseRoot")
+
     links = {}
-    for a in root.select("a"):
-        txt = a.get_text(" ", strip=True)
-        href = a.get("href") or ""
-        if not txt or not href:
-            continue
-        if href.startswith("/"):
-            href = "https://www.amazon.com" + href
-        links[simplify(txt)] = href
+    if root:
+        for a in root.select("a[href]"):
+            txt = a.get_text(" ", strip=True)
+            href = a.get("href", "").strip()
+            if not txt or not href:
+                continue
+            abs_url = urljoin("https://www.amazon.com", href)
+            links[norm_text(txt)] = abs_url
+
     return links
 
 
-def best_match_link(subniche: str, link_map: dict) -> str | None:
-    """Find the best link for a subniche name from the left-nav link map."""
-    key = simplify(subniche)
-
-    # Exact match first
-    if key in link_map:
-        return link_map[key]
-
-    # Try removing NLP parentheses if needed
-    key2 = simplify(subniche.replace("(NLP)", "").replace("NLP", ""))
-    if key2 in link_map:
-        return link_map[key2]
-
-    # Fuzzy: choose the link key with max overlap
-    best_url = None
-    best_score = 0
-    for k, url in link_map.items():
-        score = 0
-        for ch in set(key):
-            if ch in k:
-                score += 1
-        if score > best_score:
-            best_score = score
-            best_url = url
-
-    # Require a minimum score so we don't pick nonsense
-    return best_url if best_score >= max(8, len(key) // 2) else None
-
-
-def extract_5th_asin(bestseller_html: str) -> str | None:
-    """Get ASIN of the #5 item on a bestseller list page."""
-    soup = BeautifulSoup(bestseller_html, "lxml")
-    items = soup.select("ol#zg-ordered-list > li")
-    if len(items) >= 5:
-        block = str(items[4])
-        m = re.search(r"/dp/([A-Z0-9]{10})", block)
-        if m:
-            return m.group(1)
-
-    # fallback: 5th unique /dp/ASIN on the page
-    asins = []
-    for m in re.finditer(r"/dp/([A-Z0-9]{10})", bestseller_html):
-        a = m.group(1)
-        if a not in asins:
-            asins.append(a)
-    return asins[4] if len(asins) >= 5 else None
-
-
-def extract_title(product_html: str) -> str:
-    soup = BeautifulSoup(product_html, "lxml")
-    t = soup.select_one("#productTitle")
-    if t:
-        return t.get_text(" ", strip=True)
-    tt = soup.find("title")
-    return tt.get_text(" ", strip=True) if tt else ""
-
-
-def extract_best_sellers_rank(product_html: str) -> int | None:
+def pick_best_match(target: str, link_map: dict) -> str | None:
     """
-    Extract the first number after 'Best Sellers Rank' from common product-detail sections.
+    Find the best matching link for a target subniche name.
     """
-    soup = BeautifulSoup(product_html, "lxml")
+    nt = norm_text(target)
+    if nt in link_map:
+        return link_map[nt]
 
+    best = (0.0, None)
+    for k, v in link_map.items():
+        sc = token_score(nt, k)
+        if sc > best[0]:
+            best = (sc, v)
+
+    # Require a decent match, otherwise return None
+    return best[1] if best[0] >= 0.5 else None
+
+
+def parse_bestseller_ranked_items(html: str) -> list[dict]:
+    """
+    Parse the ordered list of best sellers.
+    Returns list of dicts: {rank, title, url, asin}
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # Most best-seller pages use this:
+    ol = soup.select_one("ol#zg-ordered-list")
     candidates = []
-    for sel in [
-        "#detailBulletsWrapper_feature_div",
-        "#detailBullets_feature_div",
-        "#productDetails_detailBullets_sections1",
-        "#productDetails_db_sections",
-        "#bookDetails_feature_div",
-    ]:
-        node = soup.select_one(sel)
-        if node:
-            candidates.append(node.get_text("\n", strip=True))
+    if ol:
+        lis = ol.select(":scope > li")
+        for idx, li in enumerate(lis, start=1):
+            a = li.select_one("a.a-link-normal[href*='/dp/'], a.a-link-normal[href*='/gp/']")
+            if not a:
+                continue
+            href = urljoin("https://www.amazon.com", a.get("href", ""))
+            title = None
 
-    candidates.append(soup.get_text("\n", strip=True))
+            t = li.select_one("div.p13n-sc-truncated")
+            if t and t.get_text(strip=True):
+                title = t.get_text(" ", strip=True)
+            if not title:
+                img = li.select_one("img[alt]")
+                if img and img.get("alt"):
+                    title = img.get("alt").strip()
+            if not title:
+                title = a.get_text(" ", strip=True) or ""
 
-    for text in candidates:
-        idx = text.lower().find("best sellers rank")
-        snippet = text[idx: idx + 7000] if idx != -1 else text
-        m = re.search(r"Best\s*Sellers\s*Rank.*?#\s*([\d,]+)", snippet, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            return int(m.group(1).replace(",", ""))
-    return None
+            asin = None
+            m = re.search(r"/dp/([A-Z0-9]{10})", href)
+            if not m:
+                m = re.search(r"/gp/product/([A-Z0-9]{10})", href)
+            if m:
+                asin = m.group(1)
+
+            candidates.append({"rank": idx, "title": title, "url": href, "asin": asin})
+
+    # Fallback: if structure changes, grab dp links and keep first 100 unique
+    if not candidates:
+        seen = set()
+        for a in soup.select("a[href*='/dp/']"):
+            href = urljoin("https://www.amazon.com", a.get("href", ""))
+            m = re.search(r"/dp/([A-Z0-9]{10})", href)
+            if not m:
+                continue
+            asin = m.group(1)
+            if asin in seen:
+                continue
+            seen.add(asin)
+
+            title = a.get_text(" ", strip=True)
+            if not title:
+                img = a.select_one("img[alt]")
+                if img and img.get("alt"):
+                    title = img.get("alt").strip()
+
+            candidates.append({"rank": len(candidates) + 1, "title": title or "", "url": href, "asin": asin})
+            if len(candidates) >= 100:
+                break
+
+    return candidates
 
 
-def topic_keywords(title: str) -> str:
-    stop = {"the","and","for","with","your","you","how","to","a","an","of","in","on","at","from",
-            "book","guide","workbook","journal","edition","revised","ultimate","complete"}
-    words = re.findall(r"[A-Za-z']{3,}", (title or "").lower())
-    out = []
-    seen = set()
-    for w in words:
-        if w in stop or w in seen:
-            continue
-        seen.add(w)
-        out.append(w)
-    return ", ".join(out[:6])
+def parse_best_sellers_rank_number(product_html: str) -> tuple[int | None, str]:
+    """
+    Extract the first numeric "Best Sellers Rank" value from product page.
+    Returns (bsr_number, context_text)
+    """
+    soup = BeautifulSoup(product_html, "lxml")
+
+    # Try targeted areas first
+    sections = []
+    for sec_id in ["detailBullets_feature_div", "detailBulletsWrapper_feature_div", "prodDetails", "bookDetails_container"]:
+        s = soup.find(id=sec_id)
+        if s:
+            sections.append(s.get_text("\n", strip=True))
+
+    # Add full text as last resort (can be large)
+    sections.append(soup.get_text("\n", strip=True))
+
+    joined = "\n".join(sections)
+
+    # Match either "Amazon Best Sellers Rank" or "Best Sellers Rank"
+    # Capture first "#12,345" style number after that label
+    m = re.search(r"(Amazon\s+Best\s+Sellers\s+Rank|Best\s+Sellers\s+Rank)\s*[:\-]?\s*#\s*([\d,]+)", joined, re.IGNORECASE)
+    if not m:
+        # Sometimes formatted like "Best Sellers Rank #12,345 in Kindle Store"
+        m = re.search(r"(Amazon\s+Best\s+Sellers\s+Rank|Best\s+Sellers\s+Rank).*?#\s*([\d,]+)", joined, re.IGNORECASE)
+
+    if m:
+        num = int(m.group(2).replace(",", ""))
+        # Take a short nearby context snippet for debugging
+        start = max(0, m.start() - 60)
+        end = min(len(joined), m.end() + 120)
+        ctx = joined[start:end].replace("\n", " ")
+        ctx = re.sub(r"\s+", " ", ctx).strip()
+        return num, ctx
+
+    return None, ""
 
 
+def infer_topic(title: str, subniche: str) -> str:
+    """
+    Simple, non-AI topic inference (since you want something understandable).
+    """
+    t = (title or "").lower()
+
+    # Lightweight keyword rules
+    rules = [
+        ("anxiety", "Anxiety / Panic / Worry"),
+        ("phobia", "Phobias"),
+        ("anger", "Anger Management"),
+        ("stress", "Stress / Burnout"),
+        ("trauma", "Trauma / Healing"),
+        ("narciss", "Narcissism / Toxic Relationships"),
+        ("adhd", "ADHD / Focus"),
+        ("habit", "Habits / Behavior Change"),
+        ("mindset", "Mindset / Growth"),
+        ("confidence", "Confidence / Self-Esteem"),
+        ("self esteem", "Self-Esteem"),
+        ("time management", "Time Management"),
+        ("productivity", "Productivity"),
+        ("affirmation", "Affirmations"),
+        ("journ", "Journaling / Writing"),
+        ("inner child", "Inner Child Work"),
+        ("nlp", "NLP"),
+        ("meditat", "Meditation / Mindfulness"),
+        ("spiritual", "Spiritual Growth"),
+    ]
+    for key, topic in rules:
+        if key in t:
+            return topic
+
+    # Fallback: subniche itself is already a good “topic”
+    return subniche
+
+
+def write_csv(path: str, rows: list[dict], fieldnames: list[str]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in fieldnames})
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    run_date = datetime.date.today().isoformat()
+    today = datetime.date.today().isoformat()
+    all_path = os.path.join(OUT_DIR, f"{today}_all.csv")
+    shortlist_path = os.path.join(OUT_DIR, f"{today}_shortlist.csv")
 
-    # Fetch main page and parse left nav links
-    base_html = wsa_fetch_html(BASE_URL)
-    link_map = extract_left_nav_links(base_html)
+    fieldnames = [
+        "date",
+        "subniche",
+        "subniche_url",
+        "picked_rank_in_subniche",
+        "title",
+        "book_url",
+        "asin",
+        "amazon_best_sellers_rank_number",
+        "shortlisted",
+        "topic",
+        "notes",
+    ]
 
-    rows = []
+    all_rows = []
     shortlist_rows = []
 
-    for sub in SUB_NICHES:
-        sub_url = best_match_link(sub, link_map)
-        if not sub_url:
-            rows.append({
-                "Date": run_date,
-                "SubNiche": sub,
-                "SubNicheRank": 5,
-                "Title": "",
-                "ASIN": "",
-                "OverallBestSellersRank": "",
-                "Shortlisted(<20000)": "N",
-                "TopicKeywords": "",
-                "ProductURL": "",
-                "Notes": "Sub-niche link not found in left nav (page may have changed)"
-            })
-            continue
+    session = requests.Session()
 
-        try:
-            best_html = wsa_fetch_html(sub_url)
-        except Exception as e:
-            rows.append({
-                "Date": run_date,
-                "SubNiche": sub,
-                "SubNicheRank": 5,
-                "Title": "",
-                "ASIN": "",
-                "OverallBestSellersRank": "",
-                "Shortlisted(<20000)": "N",
-                "TopicKeywords": "",
-                "ProductURL": "",
-                "Notes": f"Failed to load sub-niche page: {e}"
-            })
-            continue
+    try:
+        base_html = wsa_fetch_html(session, BASE_URL)
+        link_map = extract_subniche_links(base_html)
 
-        asin = extract_5th_asin(best_html)
-        if not asin:
-            rows.append({
-                "Date": run_date,
-                "SubNiche": sub,
-                "SubNicheRank": 5,
-                "Title": "",
-                "ASIN": "",
-                "OverallBestSellersRank": "",
-                "Shortlisted(<20000)": "N",
-                "TopicKeywords": "",
-                "ProductURL": "",
-                "Notes": "Could not extract #5 ASIN (layout changed or blocked HTML)"
-            })
-            continue
+        for sub in SUBNICHES:
+            row = {
+                "date": today,
+                "subniche": sub,
+                "subniche_url": "",
+                "picked_rank_in_subniche": 5,
+                "title": "",
+                "book_url": "",
+                "asin": "",
+                "amazon_best_sellers_rank_number": "",
+                "shortlisted": "N",
+                "topic": "",
+                "notes": "",
+            }
 
-        product_url = f"https://www.amazon.com/dp/{asin}"
+            sub_url = pick_best_match(sub, link_map)
+            if not sub_url:
+                row["notes"] = "sub-niche link not found on base page"
+                all_rows.append(row)
+                continue
 
-        try:
-            prod_html = wsa_fetch_html(product_url)
-        except Exception as e:
-            rows.append({
-                "Date": run_date,
-                "SubNiche": sub,
-                "SubNicheRank": 5,
-                "Title": "",
-                "ASIN": asin,
-                "OverallBestSellersRank": "",
-                "Shortlisted(<20000)": "N",
-                "TopicKeywords": "",
-                "ProductURL": product_url,
-                "Notes": f"Failed to load product page: {e}"
-            })
-            continue
+            row["subniche_url"] = sub_url
 
-        title = extract_title(prod_html)
-        rank = extract_best_sellers_rank(prod_html)
-        shortlisted = "Y" if isinstance(rank, int) and rank < RANK_THRESHOLD else "N"
+            try:
+                sub_html = wsa_fetch_html(session, sub_url)
+                items = parse_bestseller_ranked_items(sub_html)
+            except Exception as e:
+                row["notes"] = f"failed to fetch/parse subniche list: {e}"
+                all_rows.append(row)
+                continue
 
-        row = {
-            "Date": run_date,
-            "SubNiche": sub,
-            "SubNicheRank": 5,
-            "Title": title,
-            "ASIN": asin,
-            "OverallBestSellersRank": rank if rank is not None else "",
-            "Shortlisted(<20000)": shortlisted,
-            "TopicKeywords": topic_keywords(title),
-            "ProductURL": product_url,
-            "Notes": "" if rank is not None else "Best Sellers Rank not found on product page"
-        }
-        rows.append(row)
-        if shortlisted == "Y":
-            shortlist_rows.append(row)
+            if len(items) < 5:
+                row["notes"] = f"subniche list has < 5 items (found {len(items)})"
+                all_rows.append(row)
+                continue
 
-    pd.DataFrame(rows).to_csv(f"{OUTPUT_DIR}/{run_date}_all.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(shortlist_rows).to_csv(f"{OUTPUT_DIR}/{run_date}_shortlist.csv", index=False, encoding="utf-8-sig")
+            fifth = items[4]
+            row["title"] = fifth.get("title", "")
+            row["book_url"] = fifth.get("url", "")
+            row["asin"] = fifth.get("asin", "")
+
+            if not row["book_url"]:
+                row["notes"] = "could not extract book url for #5"
+                all_rows.append(row)
+                continue
+
+            try:
+                prod_html = wsa_fetch_html(session, row["book_url"])
+                bsr_num, ctx = parse_best_sellers_rank_number(prod_html)
+            except Exception as e:
+                row["notes"] = f"failed to fetch/parse product page: {e}"
+                all_rows.append(row)
+                continue
+
+            if bsr_num is None:
+                row["notes"] = "Best Sellers Rank not found on product page"
+                all_rows.append(row)
+                continue
+
+            row["amazon_best_sellers_rank_number"] = bsr_num
+            row["topic"] = infer_topic(row["title"], sub)
+
+            if bsr_num < MAX_BSR:
+                row["shortlisted"] = "Y"
+                shortlist_rows.append(row.copy())
+
+            all_rows.append(row)
+
+    except Exception as e:
+        # If BASE_URL fetch fails (like 429 for too long), we still write CSVs so you get artifacts.
+        all_rows = [{
+            "date": today,
+            "subniche": "",
+            "subniche_url": "",
+            "picked_rank_in_subniche": "",
+            "title": "",
+            "book_url": "",
+            "asin": "",
+            "amazon_best_sellers_rank_number": "",
+            "shortlisted": "",
+            "topic": "",
+            "notes": f"RUN FAILED EARLY: {e}",
+        }]
+        shortlist_rows = []
+
+    # Always write output files (so GitHub Artifacts will show something)
+    write_csv(all_path, all_rows, fieldnames)
+    write_csv(shortlist_path, shortlist_rows, fieldnames)
+
+    print(f"Wrote: {all_path}")
+    print(f"Wrote: {shortlist_path}")
 
 
 if __name__ == "__main__":
