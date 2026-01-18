@@ -143,4 +143,226 @@ def resolve_category_id(subniche: str) -> str | None:
     Uses helper to find a category_id. We then construct the best-seller URL ourselves.
     """
     q = f"{subniche} self help kindle"
-    helper_url = f"{HELPER_CATEGORI
+    helper_url = f"{HELPER_CATEGORIES}?q={quote_plus(q)}&limit=25"
+
+    r = requests.get(helper_url, timeout=60)
+    r.raise_for_status()
+    items = r.json() if isinstance(r.json(), list) else []
+    if not items:
+        return None
+
+    best_id = None
+    best_score = 0.0
+
+    for it in items:
+        cid = it.get("category_id")
+        link = (it.get("link") or "")
+        page_title = (it.get("page_title") or "")
+        cat_title = (it.get("category_title") or "")
+        combined = f"{page_title} {cat_title} {link}"
+
+        # Prefer anything that hints Kindle/digital-text
+        bonus = 0.0
+        low = combined.lower()
+        if "kindle" in low or "digital-text" in low:
+            bonus += 0.2
+        if "self-help" in low or "self help" in low:
+            bonus += 0.15
+
+        sc = score_match(subniche, combined) + bonus
+
+        if cid and sc > best_score:
+            best_score = sc
+            best_id = str(cid)
+
+    return best_id
+
+
+def build_bestseller_url(category_id: str) -> str:
+    # Construct Kindle best seller page for that node
+    return f"https://www.amazon.com/Best-Sellers-Kindle-Store/zgbs/digital-text/{category_id}"
+
+
+def extract_5th_asin(list_html: str) -> str | None:
+    """
+    Extract #5 ASIN from a best-seller list page.
+    Works across multiple layouts by using unique /dp/ ASIN extraction.
+    """
+    # First try ordered list
+    soup = BeautifulSoup(list_html, "lxml")
+    li_items = soup.select("ol#zg-ordered-list > li")
+    if len(li_items) >= 5:
+        block = str(li_items[4])
+        m = re.search(r"/dp/([A-Z0-9]{10})", block)
+        if m:
+            return m.group(1)
+
+    # Fallback: 5th unique /dp/ASIN on the page
+    asins = []
+    for m in re.finditer(r"/dp/([A-Z0-9]{10})", list_html):
+        a = m.group(1)
+        if a not in asins:
+            asins.append(a)
+    return asins[4] if len(asins) >= 5 else None
+
+
+def extract_title_author(product_html: str) -> tuple[str, str]:
+    soup = BeautifulSoup(product_html, "lxml")
+
+    title = ""
+    t = soup.select_one("#productTitle")
+    if t:
+        title = t.get_text(" ", strip=True)
+
+    author = ""
+    by = soup.select_one("#bylineInfo")
+    if by:
+        author = by.get_text(" ", strip=True)
+
+    return title, author
+
+
+def extract_bsr(product_html: str) -> int | None:
+    """
+    Extract the first numeric Best Sellers Rank from full page text.
+    Using JS-rendered HTML helps when it’s behind “See all details”.
+    """
+    soup = BeautifulSoup(product_html, "lxml")
+    text = soup.get_text("\n", strip=True)
+
+    idx = text.lower().find("best sellers rank")
+    if idx == -1:
+        idx = text.lower().find("amazon best sellers rank")
+    if idx == -1:
+        return None
+
+    window = text[idx: idx + 5000]
+    m = re.search(r"#\s*([\d,]+)", window)
+    if not m:
+        return None
+    return int(m.group(1).replace(",", ""))
+
+
+def topic_keywords(title: str) -> str:
+    stop = {
+        "the", "and", "for", "with", "your", "you", "how", "to", "a", "an", "of", "in", "on", "at", "from",
+        "book", "guide", "workbook", "journal", "edition", "revised", "ultimate", "complete"
+    }
+    words = re.findall(r"[A-Za-z']{3,}", (title or "").lower())
+    out, seen = [], set()
+    for w in words:
+        if w in stop or w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    return ", ".join(out[:6])
+
+
+def write_csv(path: str, rows: list[dict], headers: list[str]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def main():
+    today = datetime.date.today().isoformat()
+
+    headers = [
+        "Date", "SubNiche", "SubNicheRank", "Title", "Author", "ASIN",
+        "OverallBestSellersRank", "Shortlisted(<20000)", "TopicKeywords", "ProductURL", "Notes"
+    ]
+
+    all_rows = []
+    shortlist_rows = []
+
+    for sub in SUB_NICHES:
+        row = {
+            "Date": today,
+            "SubNiche": sub,
+            "SubNicheRank": 5,
+            "Title": "",
+            "Author": "",
+            "ASIN": "",
+            "OverallBestSellersRank": "",
+            "Shortlisted(<20000)": "N",
+            "TopicKeywords": "",
+            "ProductURL": "",
+            "Notes": "",
+        }
+
+        try:
+            cid = resolve_category_id(sub)
+            if not cid:
+                row["Notes"] = "Category ID not found via helper"
+                all_rows.append(row)
+                continue
+
+            list_url = build_bestseller_url(cid)
+
+            # Fetch list page (try no-JS first, then JS if layout missing)
+            list_html = wsa_fetch_html(list_url, render_js=0)
+            if looks_blocked(list_html) or ("/dp/" not in list_html and "zg-ordered-list" not in list_html):
+                list_html = wsa_fetch_html(list_url, render_js=1)
+
+            if looks_blocked(list_html):
+                row["Notes"] = "Blocked/Captcha page received for list page"
+                all_rows.append(row)
+                continue
+
+            asin = extract_5th_asin(list_html)
+            if not asin:
+                row["Notes"] = "Could not extract #5 ASIN from list page"
+                all_rows.append(row)
+                continue
+
+            product_url = f"https://www.amazon.com/dp/{asin}"
+            row["ASIN"] = asin
+            row["ProductURL"] = product_url
+
+            # Product page: use JS rendering (helps “See all details” / hidden BSR)
+            prod_html = wsa_fetch_html(product_url, render_js=1)
+
+            if looks_blocked(prod_html):
+                row["Notes"] = "Blocked/Captcha page received for product page"
+                all_rows.append(row)
+                continue
+
+            title, author = extract_title_author(prod_html)
+            bsr = extract_bsr(prod_html)
+
+            row["Title"] = title
+            row["Author"] = author
+            row["OverallBestSellersRank"] = bsr if bsr is not None else ""
+            row["TopicKeywords"] = topic_keywords(title)
+
+            if not title:
+                row["Notes"] = "Title not found on product page (layout mismatch)"
+            if bsr is None:
+                row["Notes"] = (row["Notes"] + " | " if row["Notes"] else "") + "BSR not found (may still be hidden)"
+
+            if isinstance(bsr, int) and bsr < BSR_THRESHOLD:
+                row["Shortlisted(<20000)"] = "Y"
+                shortlist_rows.append(row.copy())
+
+            all_rows.append(row)
+
+        except Exception as e:
+            row["Notes"] = f"Error: {e}"
+            all_rows.append(row)
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    write_csv(f"{OUT_DIR}/{today}_all.csv", all_rows, headers)
+    write_csv(f"{OUT_DIR}/{today}_shortlist.csv", shortlist_rows, headers)
+
+    titles_count = sum(1 for r in all_rows if (r.get("Title") or "").strip())
+    print(f"Done. Titles captured: {titles_count}. Shortlisted: {len(shortlist_rows)}.")
+
+    # If nothing captured at all, fail the run so you notice.
+    if titles_count == 0:
+        raise RuntimeError("No titles captured across all sub-niches. Likely blocked HTML or wrong category IDs.")
+
+
+if __name__ == "__main__":
+    main()
