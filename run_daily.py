@@ -292,4 +292,13 @@ def infer_topic(title: str) -> str:
         ("self-esteem", "Self-esteem"),
         ("trauma", "Trauma healing"),
         ("inner child", "Inner child healing"),
-        ("journ", "Journaling / prompts)
+        ("journ", "Journaling / prompts")
+        ("happiness", "Happiness"),
+        ("success", "Success & achievement"),
+        ("time", "Time management"),
+        ("communication", "Communication skills"),
+        ("relationship", "Relationships"),
+        ("mindfulness", "Mindfulness"),
+        ("meditation", "Meditation"),
+        ("affirmation", "Affirmations"),
+    ]
